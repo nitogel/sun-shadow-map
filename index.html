@@ -1,0 +1,1251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>ShadowMap — Sun &amp; Shadow Simulator</title>
+
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/deck.gl@9.0.38/dist.min.js"></script>
+<script src="https://unpkg.com/suncalc@1.9.0/suncalc.js"></script>
+<script src="https://code.highcharts.com/11.4.8/highcharts.js"></script>
+
+<style>
+  :root {
+    --bg: #11151c;
+    --panel: rgba(20, 26, 35, 0.92);
+    --panel-solid: #141a23;
+    --border: rgba(255,255,255,0.10);
+    --text: #e8edf4;
+    --muted: #93a1b3;
+    --accent: #ffb13b;
+    --accent-2: #4ea1ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--text);
+    background: var(--bg);
+    overflow: hidden;
+  }
+  #map { position: absolute; inset: 0; }
+  /* Atmospheric tint: multiplies the whole scene (ground + buildings) by a
+     sun-altitude colour — neutral at midday, warm at golden hour, deep blue
+     at night. pointer-events:none so the map stays interactive. */
+  #sky {
+    position: absolute; inset: 0; z-index: 3; pointer-events: none;
+    background-color: rgb(255,255,255);
+    mix-blend-mode: multiply;
+    transition: background-color 0.25s linear;
+  }
+  /* Sundial renders in its own canvas ABOVE #sky so the atmospheric tint and
+     the GPU building-shadow pass never darken it — it stays a bright,
+     readable instrument overlay at any time of day. */
+  #dialcanvas {
+    position: absolute; inset: 0; z-index: 4; pointer-events: none;
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    box-shadow: 0 10px 40px rgba(0,0,0,0.45);
+  }
+
+  /* Top-left: brand + search */
+  #topbar {
+    position: absolute; top: 16px; left: 16px; z-index: 5;
+    display: flex; flex-direction: column; gap: 10px;
+    width: 340px; max-width: calc(100vw - 32px);
+  }
+  #brand {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 16px;
+  }
+  #brand .dot {
+    width: 26px; height: 26px; border-radius: 50%;
+    background: radial-gradient(circle at 35% 35%, #fff7e6, var(--accent) 60%, #b76b00);
+    box-shadow: 0 0 18px rgba(255,177,59,0.65);
+    flex: none;
+  }
+  #brand h1 { font-size: 16px; font-weight: 700; letter-spacing: 0.2px; }
+  #brand span { font-size: 11.5px; color: var(--muted); display: block; font-weight: 500; }
+
+  #searchWrap { display: flex; padding: 8px; gap: 6px; }
+  #searchInput {
+    flex: 1; border: none; outline: none; background: rgba(255,255,255,0.06);
+    color: var(--text); padding: 10px 12px; border-radius: 9px; font-size: 13.5px;
+  }
+  #searchInput::placeholder { color: var(--muted); }
+  #searchBtn {
+    border: none; background: var(--accent-2); color: #06121f; font-weight: 700;
+    padding: 0 14px; border-radius: 9px; cursor: pointer; font-size: 13px;
+  }
+  #searchBtn:hover { filter: brightness(1.08); }
+
+
+  /* Bottom control bar */
+  #controls {
+    position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%);
+    z-index: 5; width: min(720px, calc(100vw - 32px));
+    padding: 14px 18px 16px;
+  }
+  #ctrlTop { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  #playBtn {
+    width: 42px; height: 42px; border-radius: 50%; border: none; cursor: pointer;
+    background: var(--accent); color: #1a1205; font-size: 16px; flex: none;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #playBtn:hover { filter: brightness(1.07); }
+  .field { display: flex; flex-direction: column; gap: 3px; }
+  .field label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); }
+  input[type="date"] {
+    background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 7px 9px; font-size: 13px; color-scheme: dark;
+  }
+  #timeReadout { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; min-width: 86px; }
+  #dateReadout { font-size: 11.5px; color: var(--muted); }
+  .field.solar { margin-left: auto; }
+  .field.solar + .field.solar { margin-left: 18px; }
+  #tiltReadout, #insReadout { font-size: 16px; font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+  #insChart { width: 100%; height: 84px; margin-top: 10px; }
+  #sliderRow { margin-top: 6px; display: flex; align-items: center; gap: 12px; }
+  #sliderRow .ends { font-size: 10.5px; color: var(--muted); width: 34px; text-align: center; }
+  input[type="range"] {
+    -webkit-appearance: none; appearance: none; height: 6px; border-radius: 4px; flex: 1;
+    background: linear-gradient(90deg, #1d2733, #3a4a5e);
+    outline: none;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 20px; height: 20px; border-radius: 50%;
+    background: var(--accent); cursor: pointer; border: 3px solid #1a1205;
+    box-shadow: 0 0 10px rgba(255,177,59,0.6);
+  }
+  #extra { display: flex; align-items: center; gap: 16px; margin-top: 14px; flex-wrap: wrap; }
+  #extra .field-inline { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  #extra input[type="range"] { width: 110px; flex: none; }
+  .speedSel {
+    background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: var(--text);
+    border-radius: 7px; padding: 5px 7px; font-size: 12px; color-scheme: dark;
+  }
+  #nowBtn {
+    background: rgba(255,255,255,0.07); border: 1px solid var(--border); color: var(--text);
+    border-radius: 7px; padding: 6px 12px; font-size: 12px; cursor: pointer;
+  }
+  #nowBtn:hover { background: rgba(255,255,255,0.13); }
+
+  /* Status toast */
+  #status {
+    position: absolute; left: 50%; top: 16px; transform: translateX(-50%);
+    z-index: 6; padding: 8px 16px; font-size: 12.5px; border-radius: 999px;
+    display: none; align-items: center; gap: 8px;
+  }
+  #status.show { display: flex; }
+  .spinner {
+    width: 13px; height: 13px; border: 2px solid rgba(255,255,255,0.25);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  #attrib {
+    position: absolute; right: 8px; bottom: 4px; z-index: 4;
+    font-size: 10px; color: rgba(255,255,255,0.45);
+  }
+  #attrib a { color: rgba(255,255,255,0.6); }
+
+  #compass {
+    position: absolute; left: 20px; top: 50%; transform: translateY(-50%);
+    z-index: 5;
+    width: 60px; height: 60px; border-radius: 50%;
+    background: var(--panel); border: 1px solid var(--border);
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    box-shadow: 0 8px 26px rgba(0,0,0,0.42);
+    cursor: grab; touch-action: none; user-select: none;
+  }
+  #compass:active { cursor: grabbing; }
+  #compass .rose {
+    position: absolute; inset: 0; transition: transform 0.06s linear;
+  }
+  #compass svg { width: 100%; height: 100%; display: block; }
+  #compass .clabel {
+    position: absolute; left: 0; right: 0; bottom: -18px; text-align: center;
+    font-size: 9.5px; letter-spacing: 0.5px; color: var(--muted);
+    pointer-events: none;
+  }
+
+  @media (max-width: 640px) {
+    #topbar { width: calc(100vw - 32px); }
+  }
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+<div id="sky"></div>
+<canvas id="dialcanvas"></canvas>
+
+<div id="topbar">
+  <div class="panel" id="brand">
+    <div class="dot"></div>
+    <div>
+      <h1>ShadowMap</h1>
+      <span>Sun &amp; building shadow simulator</span>
+    </div>
+  </div>
+  <div class="panel" id="searchWrap">
+    <input id="searchInput" type="text" placeholder="Search a city or address…" autocomplete="off" />
+    <button id="searchBtn">Go</button>
+  </div>
+</div>
+
+
+<div class="panel" id="controls">
+  <div id="ctrlTop">
+    <button id="playBtn" title="Play / pause day animation">▶</button>
+    <div class="field">
+      <label>Time of day (local solar)</label>
+      <div id="timeReadout">12:00</div>
+    </div>
+    <div class="field">
+      <label>Date</label>
+      <input id="dateInput" type="date" />
+      <div id="dateReadout"></div>
+    </div>
+    <button id="nowBtn" title="Jump to current date &amp; time">Now</button>
+    <div class="field solar">
+      <label>Panel tilt · best (day) / optimal (year)</label>
+      <div id="tiltReadout">–</div>
+    </div>
+    <div class="field solar">
+      <label>Solar insolation / day</label>
+      <div id="insReadout">–</div>
+    </div>
+  </div>
+
+  <div id="insChart" aria-label="Hourly solar insolation"></div>
+
+  <div id="sliderRow">
+    <span class="ends">00:00</span>
+    <input id="timeSlider" type="range" min="0" max="1439" step="1" value="720" />
+    <span class="ends">24:00</span>
+  </div>
+
+  <div id="extra">
+    <div class="field-inline">
+      <span>Speed</span>
+      <select id="speedSel" class="speedSel">
+        <option value="2">Slow</option>
+        <option value="6" selected>Normal</option>
+        <option value="15">Fast</option>
+        <option value="40">Very fast</option>
+      </select>
+    </div>
+    <div class="field-inline">
+      <span>Shadow strength</span>
+      <input id="shadowStrength" type="range" min="12" max="80" step="1" value="38" />
+    </div>
+    <div class="field-inline">
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+        <input id="dial3dToggle" type="checkbox" checked />
+        <span>3D sun path</span>
+      </label>
+    </div>
+  </div>
+</div>
+
+<div class="panel" id="status"><span class="spinner"></span><span id="statusText">Loading…</span></div>
+
+<div id="compass" title="Click: face north · Drag: rotate the map">
+  <div class="rose">
+    <svg viewBox="0 0 60 60" aria-label="Compass">
+      <circle cx="30" cy="30" r="22" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="1"/>
+      <polygon points="30,7 24,31 36,31" fill="#ff5a4d"/>
+      <polygon points="30,53 24,29 36,29" fill="#8b97a8"/>
+      <circle cx="30" cy="30" r="2.6" fill="#e8edf4"/>
+      <text x="30" y="17" text-anchor="middle" font-size="8" font-weight="700" fill="#fff">N</text>
+    </svg>
+  </div>
+  <div class="clabel">North</div>
+</div>
+
+<div id="attrib">
+  © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> ·
+  <a href="https://carto.com/attributions" target="_blank" rel="noopener">CARTO</a> ·
+  buildings via Overpass · sun via SunCalc
+</div>
+
+<script>
+"use strict";
+
+/* ----------------------------------------------------------------------------
+   ShadowMap — single-file sun-shadow simulator
+   Stack: MapLibre GL (basemap) + deck.gl (extruded OSM buildings + SunLight
+   shadow effect) + SunCalc (sun info) + Overpass (building data) + Nominatim.
+
+   Time model: the date/time chosen is treated as *local solar time* at the map
+   centre. We approximate the timezone purely from longitude (lon / 15° = hours)
+   so that "12:00" is always ~solar noon anywhere on Earth. For a sun-study tool
+   this is more intuitive and robust than resolving political time zones.
+---------------------------------------------------------------------------- */
+
+const DEFAULT = { lng: -73.9857, lat: 40.7580, zoom: 16, pitch: 52, bearing: 18 }; // Midtown Manhattan
+
+// Restore the camera from ?lat=&lng=&z=&pitch=&bearing= so a saved/bookmarked
+// URL reopens at the same position. Falls back to DEFAULT for missing params.
+function readViewFromURL() {
+  const q = new URLSearchParams(location.search);
+  const num = (k, d) => { const v = parseFloat(q.get(k)); return Number.isFinite(v) ? v : d; };
+  return {
+    lng: num("lng", DEFAULT.lng),
+    lat: num("lat", DEFAULT.lat),
+    zoom: num("z", DEFAULT.zoom),
+    pitch: num("pitch", DEFAULT.pitch),
+    bearing: num("bearing", DEFAULT.bearing)
+  };
+}
+const VIEW0 = readViewFromURL();
+
+// Mirror the live camera into the URL (replaceState — no history spam) so the
+// address bar is always a shareable permalink. Other params are preserved.
+let _urlTimer = 0;
+function updateURL() {
+  const c = map.getCenter();
+  const q = new URLSearchParams(location.search);
+  q.set("lat", c.lat.toFixed(6));
+  q.set("lng", c.lng.toFixed(6));
+  q.set("z", map.getZoom().toFixed(2));
+  q.set("pitch", map.getPitch().toFixed(1));
+  q.set("bearing", map.getBearing().toFixed(1));
+  history.replaceState(null, "", location.pathname + "?" + q.toString());
+}
+function updateURLThrottled() {
+  if (_urlTimer) return;
+  _urlTimer = setTimeout(() => { _urlTimer = 0; updateURL(); }, 200);
+}
+
+// ---- State ----------------------------------------------------------------
+let state = {
+  dateStr: isoDate(new Date(2026, 4, 17)), // YYYY-MM-DD (local solar)
+  minutes: 720,                            // 0..1439 minutes after local-solar midnight
+  playing: false,
+  speed: 6,                                // sim-minutes added per animation frame
+  shadowAlpha: 0.38,
+  dial3d: true
+};
+let buildingsFC = { type: "FeatureCollection", features: [] };
+let lastBBoxKey = null;
+let fetchToken = 0;
+
+// ---- Map ------------------------------------------------------------------
+const map = new maplibregl.Map({
+  container: "map",
+  style: "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+  center: [VIEW0.lng, VIEW0.lat],
+  zoom: VIEW0.zoom,
+  pitch: VIEW0.pitch,
+  bearing: VIEW0.bearing,
+  maxPitch: 75,
+  attributionControl: false
+});
+// Zoom buttons only — rotation/orientation is handled by the custom #compass.
+map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-left");
+
+// ---- deck.gl overlay (overlaid mode — required for the shadow effect) ------
+const { MapboxOverlay, GeoJsonLayer, PolygonLayer, LightingEffect, AmbientLight,
+        ScatterplotLayer, PathLayer, LineLayer, TextLayer, COORDINATE_SYSTEM } = deck;
+const SunLight = deck._SunLight; // experimental: positions a directional light from a timestamp
+let sundialLayers = [];
+
+// Lighting is created ONCE and mutated in place. Re-creating the SunLight /
+// LightingEffect on every update was the cause of the "flat grey until you
+// move the map" bug: a freshly-created shadow pass only renders after an
+// extra redraw, and deck only redraws on detected change — so an idle map
+// kept showing the un-shadowed frame (deck.gl issues #3543 / #3521).
+// Low ambient + strong sun = high contrast, so a building dropped into a
+// neighbour's shadow goes clearly dark instead of staying washed out.
+const ambientLight = new AmbientLight({ color: [255, 255, 255], intensity: 0.6 });
+const sunLight = new SunLight({
+  timestamp: Date.now(),
+  color: [255, 250, 235],
+  intensity: 2.4,
+  _shadow: true
+});
+const lightingEffect = new LightingEffect({ ambientLight, sunLight });
+function shadowAlpha255() { return Math.min(0.92, state.shadowAlpha + 0.32); }
+lightingEffect.shadowColor = [0, 0, 0, shadowAlpha255()];
+
+const deckOverlay = new MapboxOverlay({
+  interleaved: false,
+  effects: [lightingEffect],
+  layers: []
+});
+map.addControl(deckOverlay);
+
+// Separate deck.gl instance for the sundial, on its own canvas stacked above
+// the #sky tint overlay. It has NO LightingEffect, so the building-shadow
+// pass and the atmosphere never touch it. Its camera is kept in lock-step
+// with the MapLibre map every frame.
+const sundialDeck = new deck.Deck({
+  canvas: "dialcanvas",
+  views: new deck.MapView({ repeat: false }),
+  controller: false,
+  viewState: {
+    longitude: VIEW0.lng, latitude: VIEW0.lat,
+    zoom: VIEW0.zoom, pitch: VIEW0.pitch, bearing: VIEW0.bearing
+  },
+  layers: []
+});
+// Single source of truth for the dial: read the map centre ONCE and derive
+// BOTH the geometry anchor and the deck camera from that same value. Splitting
+// these across two events/reads let them settle a frame out of phase, leaving
+// the ring offset from screen-centre. Heavy orbit rebuild is cache-gated in
+// buildSundial3D, so calling this every painted frame is cheap when idle.
+function syncSundialDeck() {
+  const c = map.getCenter();
+  const zoom = map.getZoom(), pitch = map.getPitch(), bearing = map.getBearing();
+  if (state.dial3d) {
+    const date = currentUTCDate();
+    const pos = SunCalc.getPosition(date, c.lat, c.lng);
+    const times = SunCalc.getTimes(date, c.lat, c.lng);
+    sundialLayers = buildSundial3D(c.lng, c.lat, pos, times);
+  } else {
+    sundialLayers = [];
+  }
+  sundialDeck.setProps({
+    viewState: { longitude: c.lng, latitude: c.lat, zoom, pitch, bearing },
+    layers: sundialLayers
+  });
+  // setProps only *schedules* a draw on deck's own rAF — one frame behind the
+  // map, so the dial visibly trails the basemap during a drag. Force a
+  // synchronous redraw here so both canvases present the SAME frame.
+  try { sundialDeck.redraw("sync"); } catch (e) {}
+}
+// 'render' fires every painted frame so the dial stays glued (geometry +
+// camera always from the same centre); 'move' covers programmatic jumps.
+map.on("render", syncSundialDeck);
+map.on("move", syncSundialDeck);
+map.on("move", updateURLThrottled);
+map.on("moveend", updateURL);
+
+// ---- Compass: shows orientation, click = face north, drag = rotate --------
+const compassEl = document.getElementById("compass");
+const compassRose = compassEl.querySelector(".rose");
+function updateCompass() {
+  // Counter-rotate the rose so the red arrow always points to true north.
+  compassRose.style.transform = "rotate(" + (-map.getBearing()) + "deg)";
+}
+map.on("rotate", updateCompass);
+map.on("pitch", updateCompass);
+
+let cDragging = false, cMoved = false, cStartAngle = 0, cStartBearing = 0;
+function pointerAngle(e) {
+  const r = compassEl.getBoundingClientRect();
+  return Math.atan2(e.clientY - (r.top + r.height / 2),
+                    e.clientX - (r.left + r.width / 2)) * 180 / Math.PI;
+}
+compassEl.addEventListener("pointerdown", e => {
+  cDragging = true; cMoved = false;
+  cStartAngle = pointerAngle(e);
+  cStartBearing = map.getBearing();
+  try { compassEl.setPointerCapture(e.pointerId); } catch (_) {}
+  e.preventDefault();
+});
+compassEl.addEventListener("pointermove", e => {
+  if (!cDragging) return;
+  const delta = pointerAngle(e) - cStartAngle;
+  if (Math.abs(delta) > 2) cMoved = true;
+  // Subtract so the rose follows the finger (rose angle = -bearing).
+  map.setBearing(cStartBearing - delta);
+});
+compassEl.addEventListener("pointerup", e => {
+  if (!cDragging) return;
+  cDragging = false;
+  try { compassEl.releasePointerCapture(e.pointerId); } catch (_) {}
+  if (!cMoved) map.easeTo({ bearing: 0, duration: 450 });
+});
+
+// Update the sun in place (no new instances) for the current time/strength.
+function applySun(timestampMs) {
+  sunLight.timestamp = timestampMs;
+  lightingEffect.shadowColor = [0, 0, 0, shadowAlpha255()];
+  deckOverlay.setProps({ effects: [lightingEffect] });
+}
+
+// The shadow pass needs an extra redraw to settle, but deck only redraws on
+// change. After any update we pulse a few repaint frames so the shadow
+// renders and then persists while the map sits idle.
+let pulseFrames = 0, pulseScheduled = false;
+function forceShadowRedraw() {
+  pulseFrames = 6;
+  if (pulseScheduled) return;
+  pulseScheduled = true;
+  const tick = () => {
+    map.triggerRepaint();
+    if (--pulseFrames > 0) requestAnimationFrame(tick);
+    else pulseScheduled = false;
+  };
+  requestAnimationFrame(tick);
+}
+
+// ---- Atmosphere: scene tint + sun/ambient colour by sun altitude ----------
+// Keyframes by altitude (deg). `sky` multiplies the whole scene (white = no
+// change at midday; warm at golden hour; deep blue at night). `sun`/`amb`
+// colour deck.gl's lights so building facades warm up at sunset/sunrise.
+const ATMO = [
+  { a:  60, sky:[255,255,255], sun:[255,251,242], si:2.7, amb:[218,230,255], ai:0.62 },
+  { a:  14, sky:[255,252,245], sun:[255,244,222], si:2.5, amb:[221,231,252], ai:0.60 },
+  { a:   6, sky:[255,232,201], sun:[255,200,135], si:2.15, amb:[255,229,213], ai:0.56 },
+  { a:   2, sky:[255,202,159], sun:[255,159,89],  si:1.75, amb:[255,210,196], ai:0.52 },
+  { a:   0, sky:[244,173,142], sun:[255,133,73],  si:1.30, amb:[252,195,183], ai:0.50 },
+  { a:  -4, sky:[156,128,156], sun:[255,120,70],  si:0.0,  amb:[120,118,162], ai:0.50 },
+  { a:  -8, sky:[ 86, 92,142], sun:[255,120,70],  si:0.0,  amb:[ 78, 88,146], ai:0.46 },
+  { a: -14, sky:[ 50, 58,100], sun:[255,120,70],  si:0.0,  amb:[ 48, 58, 98], ai:0.42 },
+  { a: -90, sky:[ 46, 54, 94], sun:[255,120,70],  si:0.0,  amb:[ 44, 54, 92], ai:0.40 }
+];
+function lerp(t, a, b) { return a + (b - a) * t; }
+function lerpRGB(t, A, B) {
+  return [Math.round(lerp(t,A[0],B[0])),
+          Math.round(lerp(t,A[1],B[1])),
+          Math.round(lerp(t,A[2],B[2]))];
+}
+function atmosphere(alt) {
+  if (alt >= ATMO[0].a) return ATMO[0];
+  const last = ATMO[ATMO.length - 1];
+  if (alt <= last.a) return last;
+  for (let i = 0; i < ATMO.length - 1; i++) {
+    const hi = ATMO[i], lo = ATMO[i + 1];
+    if (alt <= hi.a && alt >= lo.a) {
+      const t = (alt - lo.a) / (hi.a - lo.a);
+      return {
+        sky: lerpRGB(t, lo.sky, hi.sky),
+        sun: lerpRGB(t, lo.sun, hi.sun),
+        si:  lerp(t, lo.si,  hi.si),
+        amb: lerpRGB(t, lo.amb, hi.amb),
+        ai:  lerp(t, lo.ai,  hi.ai)
+      };
+    }
+  }
+  return ATMO[0];
+}
+function applyAtmosphere(altDeg) {
+  const m = atmosphere(altDeg);
+  sunLight.color = m.sun;
+  sunLight.intensity = m.si;
+  ambientLight.color = m.amb;
+  ambientLight.intensity = m.ai;
+  document.getElementById("sky").style.backgroundColor =
+    "rgb(" + m.sky[0] + "," + m.sky[1] + "," + m.sky[2] + ")";
+}
+
+// ---- Sun / time math ------------------------------------------------------
+function isoDate(d) {
+  return d.getFullYear() + "-" +
+    String(d.getMonth() + 1).padStart(2, "0") + "-" +
+    String(d.getDate()).padStart(2, "0");
+}
+function fmtHM(mins) {
+  mins = ((Math.round(mins) % 1440) + 1440) % 1440;
+  return String(Math.floor(mins / 60)).padStart(2, "0") + ":" +
+         String(mins % 60).padStart(2, "0");
+}
+// Longitude-based offset (hours) so chosen clock time == local solar time.
+function lonOffsetHours() {
+  return map.getCenter().lng / 15;
+}
+// Convert the chosen local-solar date+time to the true UTC instant.
+function currentUTCDate() {
+  const [Y, M, D] = state.dateStr.split("-").map(Number);
+  const utcMs = Date.UTC(Y, M - 1, D, 0, 0, 0) +
+                state.minutes * 60000 -
+                lonOffsetHours() * 3600000;
+  return new Date(utcMs);
+}
+// Format a UTC Date back into local-solar HH:MM for display.
+function utcToLocalHM(d) {
+  if (!d || isNaN(d)) return "–";
+  const ms = d.getTime() + lonOffsetHours() * 3600000;
+  const t = new Date(ms);
+  return String(t.getUTCHours()).padStart(2, "0") + ":" +
+         String(t.getUTCMinutes()).padStart(2, "0");
+}
+
+function recompute() {
+  const c = map.getCenter();
+  const date = currentUTCDate();
+
+  // Sun info via SunCalc
+  const pos = SunCalc.getPosition(date, c.lat, c.lng);
+  const altDeg = pos.altitude * 180 / Math.PI;
+
+  // Tint scene + colour the sun by altitude, then update the sun in place
+  // (do NOT recreate the lighting/effect).
+  applyAtmosphere(altDeg);
+  applySun(date.getTime());
+  const times = SunCalc.getTimes(date, c.lat, c.lng);
+
+  // UI readouts
+  document.getElementById("timeReadout").textContent = fmtHM(state.minutes);
+  const [Y, M, D] = state.dateStr.split("-").map(Number);
+  document.getElementById("dateReadout").textContent =
+    new Date(Y, M - 1, D).toLocaleDateString(undefined,
+      { weekday: "short", month: "short", day: "numeric" });
+
+  refreshSolar(c.lat, c.lng);
+
+  syncSundialDeck(); // rebuilds + pushes the dial from the live map centre
+
+  // pos.azimuth is measured from south (SunCalc); +PI converts to a
+  // compass bearing (0 = N, clockwise) for the shadow projection.
+  renderLayers(altDeg, pos.altitude, pos.azimuth + Math.PI);
+}
+
+
+// ---- Sun time helper ------------------------------------------------------
+function utcDateForMinute(min) {
+  const [Y, M, D] = state.dateStr.split("-").map(Number);
+  return new Date(Date.UTC(Y, M - 1, D, 0, 0, 0) + min * 60000 -
+                  lonOffsetHours() * 3600000);
+}
+// (2D dial removed; the on-map 3D sundial below is the only sun-path UI.)
+
+// ---- Solar insolation + optimal panel tilt --------------------------------
+// Clear-sky model: Kasten-Young air mass + a simple atmospheric transmittance
+// (Meinel). Gives global horizontal irradiance (W/m²); the day integral is
+// "peak sun hours" (kWh/m²/day). Cloud cover/weather are not modelled.
+let insChart = null;
+const solarCache = { key: "" };
+
+function clearSkyGHI(altRad) {
+  if (altRad <= 0) return 0;
+  const h = altRad * 180 / Math.PI;
+  const airMass = 1 / (Math.sin(altRad) +
+    0.50572 * Math.pow(h + 6.07995, -1.6364));      // Kasten-Young
+  const dni = 1353 * Math.pow(0.7, Math.pow(airMass, 0.678)); // W/m² direct
+  const direct = dni * Math.sin(altRad);
+  return direct * 1.1; // + ~10% diffuse, on a horizontal surface
+}
+
+function refreshSolar(lat, lng) {
+  const key = state.dateStr + "|" + lat.toFixed(3) + "|" + lng.toFixed(3);
+  const nowH = state.minutes / 60;
+
+  if (key !== solarCache.key) {
+    solarCache.key = key;
+
+    // Hourly curve for the chart (0..24 h).
+    const hourly = [];
+    for (let hh = 0; hh <= 24; hh++) {
+      const p = SunCalc.getPosition(utcDateForMinute(hh * 60), lat, lng);
+      hourly.push([hh, Math.round(clearSkyGHI(p.altitude))]);
+    }
+
+    // Daily total via 10-min integration -> kWh/m²/day. Also track the
+    // solar-noon altitude (the day's max) for the optimal tilt.
+    let wh = 0, maxAlt = -90;
+    for (let m = 0; m < 1440; m += 10) {
+      const a = SunCalc.getPosition(utcDateForMinute(m), lat, lng).altitude;
+      wh += clearSkyGHI(a) * (10 / 60);
+      if (a * 180 / Math.PI > maxAlt) maxAlt = a * 180 / Math.PI;
+    }
+    const kwh = wh / 1000;
+    const face = lat >= 0 ? "S" : "N";
+    // Best for THIS day: panel normal to the sun at solar noon
+    // (tilt = 90 - solar-noon altitude).
+    const tiltBest = Math.max(0, Math.min(90, 90 - maxAlt));
+    // Optimal fixed YEAR-ROUND tilt (empirical): |lat| * 0.87 + 3.1.
+    const tiltYear = Math.max(0, Math.min(90, Math.abs(lat) * 0.87 + 3.1));
+
+    document.getElementById("tiltReadout").textContent =
+      (maxAlt <= 0 ? "—" : tiltBest.toFixed(0) + "°") +
+      " / " + tiltYear.toFixed(0) + "° · face " + face;
+    document.getElementById("insReadout").textContent =
+      kwh.toFixed(2) + " kWh/m²";
+
+    if (window.Highcharts) {
+      const opts = {
+        chart: { backgroundColor: "transparent", margin: [8, 6, 20, 38],
+                 animation: false, style: { fontFamily: "inherit" } },
+        title: { text: null }, credits: { enabled: false },
+        legend: { enabled: false },
+        xAxis: {
+          min: 0, max: 24, tickInterval: 6,
+          labels: { style: { color: "#93a1b3", fontSize: "9px" },
+                    formatter: function () { return this.value + "h"; } },
+          lineColor: "rgba(255,255,255,0.15)",
+          tickColor: "rgba(255,255,255,0.15)",
+          plotLines: [{ id: "now", value: nowH, color: "#ffb13b",
+                        width: 2, zIndex: 5 }]
+        },
+        yAxis: {
+          min: 0, title: { text: null },
+          gridLineColor: "rgba(255,255,255,0.06)",
+          labels: { style: { color: "#93a1b3", fontSize: "9px" } }
+        },
+        tooltip: {
+          backgroundColor: "#141a23",
+          borderColor: "rgba(255,255,255,0.15)",
+          style: { color: "#e8edf4", fontSize: "11px" },
+          formatter: function () {
+            return "<b>" + this.x + ":00</b> — " +
+                   Math.round(this.y) + " W/m²";
+          }
+        },
+        plotOptions: { areaspline: {
+          color: "#ffb13b", lineWidth: 2, marker: { enabled: false },
+          fillColor: { linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },
+            stops: [[0, "rgba(255,177,59,0.55)"],
+                    [1, "rgba(255,177,59,0.02)"]] } } },
+        series: [{ type: "areaspline", name: "Insolation", data: hourly }]
+      };
+      if (insChart) {
+        insChart.series[0].setData(hourly, false);
+        updateNowLine(nowH);
+        insChart.redraw(false);
+      } else {
+        insChart = Highcharts.chart("insChart", opts);
+      }
+    }
+    return;
+  }
+  updateNowLine(nowH);
+}
+
+function updateNowLine(nowH) {
+  if (!insChart) return;
+  insChart.xAxis[0].removePlotLine("now");
+  insChart.xAxis[0].addPlotLine({ id: "now", value: nowH,
+    color: "#ffb13b", width: 2, zIndex: 5 });
+}
+
+// ---- 3D sundial overlay (ShadowMap-style) ---------------------------------
+// A big sun-path compass projected onto the map at the centre: a flat compass
+// ring with degree ticks/labels, the day's 3D sun-path orbit, sunrise/sunset
+// markers, the live sun, and rays showing azimuth + altitude angles.
+const DIAL3D_CS = [...("0123456789:.,-° ABCDEFGHIJKLMNOPQRSTUVWXYZ")];
+const dial3dCache = { key: "", orbitUp: [], orbitDn: [], ring: [], ticks: [],
+                      labels: [], riseset: [], R: 200, Rc: 216 };
+
+function metersPerPixel(lat, zoom) {
+  return 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoom);
+}
+// Sun direction as a LOCAL metre offset [east, north, up] on a sphere of
+// radius R (altRad above horizon, bearingRad 0=N clockwise). The whole dial is
+// expressed in these origin-relative offsets so every part shares one anchor.
+function sunLocal(altRad, bearingRad, R) {
+  const hd = R * Math.cos(altRad);
+  return [hd * Math.sin(bearingRad), hd * Math.cos(bearingRad), R * Math.sin(altRad)];
+}
+
+function buildSundial3D(lng, lat, pos, times) {
+  const zoom = map.getZoom();
+  let R = 120 * metersPerPixel(lat, zoom); // ~constant on-screen size
+  R = Math.max(40, Math.min(3000, R));
+  const Rc = R * 1.08;
+  // The whole dial lives in LOCAL metre-offset space sharing ONE origin
+  // (the live map centre). Ring / compass / sun-path / ray are therefore one
+  // rigid object that just translates with the centre and can never separate.
+  // The cache key omits longitude (sun-path shape is lng-independent thanks to
+  // local-solar time) and keeps latitude coarse, so a pan never rebuilds it.
+  const ORIGIN = [lng, lat, 0];
+  const CS = COORDINATE_SYSTEM.METER_OFFSETS;
+  const key = state.dateStr + "|" + lat.toFixed(2) +
+              "|" + Math.round(zoom * 2) + "|" + R.toFixed(0);
+
+  if (key !== dial3dCache.key) {
+    dial3dCache.key = key;
+    const up = [], dn = [];
+    for (let m = 0; m <= 1440; m += 5) {
+      const p = SunCalc.getPosition(utcDateForMinute(m), lat, lng);
+      const b = p.azimuth + Math.PI;
+      if (p.altitude >= 0) {
+        up.push(sunLocal(p.altitude, b, R));
+      } else {
+        dn.push([R * Math.sin(b), R * Math.cos(b), 0]);
+      }
+    }
+    const ring = [], ticks = [], labels = [];
+    for (let d = 0; d <= 360; d += 3) {
+      const b = d * Math.PI / 180;
+      ring.push([Rc * Math.sin(b), Rc * Math.cos(b), 0]);
+    }
+    for (let d = 0; d < 360; d += 10) {
+      const b = d * Math.PI / 180, major = d % 30 === 0;
+      const inner = (major ? 0.93 : 0.97) * Rc;
+      ticks.push({ s: [inner * Math.sin(b), inner * Math.cos(b), 0],
+                   t: [Rc * Math.sin(b), Rc * Math.cos(b), 0] });
+      if (major) {
+        const lr = Rc * 1.08;
+        const card = { 0: "N", 90: "E", 180: "S", 270: "W" }[d];
+        labels.push({ p: [lr * Math.sin(b), lr * Math.cos(b), 0],
+                      txt: card || String(d),
+                      size: card ? 22 : 13, card: !!card });
+      }
+    }
+    const mk = t => {
+      if (!t || isNaN(t)) return null;
+      const p = SunCalc.getPosition(t, lat, lng);
+      return sunLocal(0, p.azimuth + Math.PI, R);
+    };
+    const rs = [], sr = mk(times.sunrise), ss = mk(times.sunset);
+    if (sr) rs.push({ p: sr, txt: utcToLocalHM(times.sunrise), kind: "rise" });
+    if (ss) rs.push({ p: ss, txt: utcToLocalHM(times.sunset), kind: "set" });
+    Object.assign(dial3dCache, { orbitUp: up, orbitDn: dn, ring, ticks,
+                                 labels, riseset: rs, R, Rc });
+  }
+
+  const C = dial3dCache;
+  const altRad = pos.altitude, bRad = pos.azimuth + Math.PI;
+  const below = altRad < 0;
+  const sunPos = sunLocal(Math.max(altRad, 0), bRad, C.R);
+  const rimPt = [C.Rc * Math.sin(bRad), C.Rc * Math.cos(bRad), 0];
+  const hdSun = C.R * Math.cos(Math.max(altRad, 0));
+  const gSunPt = [hdSun * Math.sin(bRad), hdSun * Math.cos(bRad), 0];
+  const center = [0, 0, 0];
+  const aziDeg = ((pos.azimuth * 180 / Math.PI) + 180 + 360) % 360;
+  const altDeg = pos.altitude * 180 / Math.PI;
+  // Sun ray: a straight line from the centre, through the sun, continuing
+  // well past it so the incoming sunbeam direction is visible.
+  const RAY_EXT = 2.6;
+  const upSun = C.R * Math.sin(Math.max(altRad, 0));
+  const rayEnd = below ? sunPos
+    : [hdSun * RAY_EXT * Math.sin(bRad), hdSun * RAY_EXT * Math.cos(bRad),
+       upSun * RAY_EXT];
+  const dash = deck.PathStyleExtension
+    ? [new deck.PathStyleExtension({ dash: true })] : [];
+  const ND = { depthTest: false };
+  const L = [];
+
+  L.push(new PathLayer({
+    id: "d3-ring", data: [C.ring], getPath: d => d,
+    getColor: [255, 255, 255, 150], getWidth: 2, widthUnits: "pixels",
+    coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+  }));
+  L.push(new LineLayer({
+    id: "d3-ticks", data: C.ticks,
+    getSourcePosition: d => d.s, getTargetPosition: d => d.t,
+    getColor: [255, 255, 255, 140], getWidth: 1.5, widthUnits: "pixels",
+    coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+  }));
+  L.push(new TextLayer({
+    id: "d3-labels", data: C.labels,
+    getPosition: d => d.p, getText: d => d.txt, getSize: d => d.size,
+    getColor: d => d.card ? [255, 255, 255, 235] : [225, 230, 240, 200],
+    billboard: true, fontFamily: "-apple-system, Arial, sans-serif",
+    fontWeight: 700, characterSet: DIAL3D_CS, sizeUnits: "pixels",
+    getTextAnchor: "middle", getAlignmentBaseline: "center", coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+  }));
+
+  if (C.orbitDn.length) {
+    L.push(new PathLayer(Object.assign({
+      id: "d3-orbit-dn", data: [C.orbitDn], getPath: d => d,
+      getColor: [255, 235, 190, 80], getWidth: 1.6, widthUnits: "pixels",
+      coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND, extensions: dash
+    }, dash.length ? { getDashArray: [6, 4], dashJustified: true } : {})));
+  }
+  L.push(new PathLayer(Object.assign({
+    id: "d3-azline", data: [[center, rimPt]], getPath: d => d,
+    getColor: [255, 255, 255, 180], getWidth: 1.6, widthUnits: "pixels",
+    coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND, extensions: dash
+  }, dash.length ? { getDashArray: [4, 3], dashJustified: true } : {})));
+
+  if (C.orbitUp.length) {
+    L.push(new PathLayer({
+      id: "d3-orbit-up", data: [C.orbitUp], getPath: d => d,
+      getColor: [255, 205, 60, 235], getWidth: 3, widthUnits: "pixels",
+      capRounded: true, jointRounded: true, coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+    }));
+  }
+
+  // Altitude leg (sun -> its point on the ground) + azimuth/ray
+  L.push(new LineLayer({
+    id: "d3-altleg", data: [{ s: sunPos, t: gSunPt }],
+    getSourcePosition: d => d.s, getTargetPosition: d => d.t,
+    getColor: [255, 255, 255, 120], getWidth: 1.4, widthUnits: "pixels",
+    coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+  }));
+  L.push(new LineLayer({
+    id: "d3-ray", data: [{ s: center, t: rayEnd }],
+    getSourcePosition: d => d.s, getTargetPosition: d => d.t,
+    getColor: below ? [185, 195, 215, 180] : [255, 209, 64, 255],
+    getWidth: below ? 2.5 : 4.5, widthUnits: "pixels", coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+  }));
+
+  L.push(new ScatterplotLayer({
+    id: "d3-rs", data: C.riseset, getPosition: d => d.p,
+    getRadius: 6, radiusUnits: "pixels",
+    getFillColor: d => d.kind === "rise" ? [255, 210, 120] : [255, 140, 90],
+    stroked: true, getLineColor: [40, 30, 10], getLineWidth: 1,
+    lineWidthUnits: "pixels", coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+  }));
+  L.push(new TextLayer({
+    id: "d3-rs-txt", data: C.riseset, getPosition: d => d.p,
+    getText: d => d.txt, getSize: 12, getColor: [25, 20, 10, 255],
+    billboard: true, fontFamily: "-apple-system, Arial, sans-serif",
+    fontWeight: 700, characterSet: DIAL3D_CS, sizeUnits: "pixels",
+    getPixelOffset: [0, -15], background: true,
+    getBackgroundColor: d => d.kind === "rise" ? [255, 212, 130, 240] : [255, 165, 115, 240],
+    backgroundPadding: [6, 4, 6, 4], coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+  }));
+
+  L.push(new ScatterplotLayer({
+    id: "d3-center", data: [center], getPosition: d => d, getRadius: 4,
+    radiusUnits: "pixels", getFillColor: [255, 255, 255, 230],
+    stroked: true, getLineColor: [0, 0, 0, 140], getLineWidth: 1,
+    lineWidthUnits: "pixels", coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+  }));
+
+  L.push(new ScatterplotLayer({
+    id: "d3-sun-halo", data: [sunPos], getPosition: d => d,
+    getRadius: below ? 9 : 22, radiusUnits: "pixels",
+    getFillColor: below ? [150, 160, 185, 70] : [255, 190, 70, 110],
+    coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+  }));
+  L.push(new ScatterplotLayer({
+    id: "d3-sun", data: [sunPos], getPosition: d => d,
+    getRadius: below ? 5 : 10, radiusUnits: "pixels",
+    getFillColor: below ? [170, 180, 200, 210] : [255, 232, 150, 255],
+    stroked: true,
+    getLineColor: below ? [120, 130, 150, 210] : [255, 180, 60, 255],
+    getLineWidth: 1.5, lineWidthUnits: "pixels", coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+  }));
+
+  L.push(new TextLayer({
+    id: "d3-suntime", data: [{ p: sunPos, txt: fmtHM(state.minutes) }],
+    getPosition: d => d.p, getText: d => d.txt, getSize: 13,
+    getColor: [35, 28, 10, 255], billboard: true,
+    fontFamily: "-apple-system, Arial, sans-serif", fontWeight: 700,
+    characterSet: DIAL3D_CS, sizeUnits: "pixels", getPixelOffset: [0, -22],
+    background: true, getBackgroundColor: [255, 222, 110, 240],
+    backgroundPadding: [6, 4, 6, 4], coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+  }));
+  L.push(new TextLayer({
+    id: "d3-angles",
+    data: [
+      { p: rimPt,  txt: "AZ " + aziDeg.toFixed(1) + "°",  off: [0, 18] },
+      { p: sunPos, txt: "ALT " + altDeg.toFixed(1) + "°", off: [62, 6] }
+    ],
+    getPosition: d => d.p, getText: d => d.txt, getSize: 12,
+    getColor: [255, 255, 255, 245], billboard: true,
+    fontFamily: "-apple-system, Arial, sans-serif", fontWeight: 700,
+    characterSet: DIAL3D_CS, sizeUnits: "pixels",
+    getPixelOffset: d => d.off, background: true,
+    getBackgroundColor: [18, 22, 32, 205], backgroundPadding: [6, 4, 6, 4],
+    coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+  }));
+
+  return L;
+}
+
+// ---- Shadow projection ----------------------------------------------------
+// Ground shadows are computed geometrically (the way dedicated shadow tools
+// do it): translate each building footprint along the sun vector by
+// height / tan(altitude), then take the convex hull of the footprint and its
+// translated copy — that silhouette is the prism's ground shadow.
+
+// Andrew's monotone-chain convex hull. pts: [[x,y],...] -> hull ring.
+function convexHull(pts) {
+  if (pts.length < 3) return pts.slice();
+  const p = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cross = (o, a, b) =>
+    (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lower = [];
+  for (const pt of p) {
+    while (lower.length >= 2 &&
+           cross(lower[lower.length - 2], lower[lower.length - 1], pt) <= 0)
+      lower.pop();
+    lower.push(pt);
+  }
+  const upper = [];
+  for (let i = p.length - 1; i >= 0; i--) {
+    const pt = p[i];
+    while (upper.length >= 2 &&
+           cross(upper[upper.length - 2], upper[upper.length - 1], pt) <= 0)
+      upper.pop();
+    upper.push(pt);
+  }
+  lower.pop(); upper.pop();
+  return lower.concat(upper);
+}
+
+function computeShadows(features, altRad, sunBearingRad) {
+  const out = [];
+  if (altRad <= 0) return out; // sun at/below horizon -> no shadows
+  const tanAlt = Math.tan(altRad);
+  // Shadow points opposite the sun. Bearing is clockwise from north, so
+  // (east, north) of the *sun* = (sin, cos); the shadow is the negative.
+  const ux = -Math.sin(sunBearingRad);
+  const uy = -Math.cos(sunBearingRad);
+  for (const f of features) {
+    const ring = f.geometry && f.geometry.coordinates && f.geometry.coordinates[0];
+    if (!ring || ring.length < 3) continue;
+    const h = f.properties.height || 9;
+    let L = h / Math.max(tanAlt, 0.018); // metres; clamp for very low sun
+    if (L > 3000) L = 3000;
+    const lat0 = ring[0][1];
+    const mPerDegLat = 111320;
+    const mPerDegLng = 111320 * Math.cos(lat0 * Math.PI / 180) || 1;
+    const dLng = (ux * L) / mPerDegLng;
+    const dLat = (uy * L) / mPerDegLat;
+    const pts = [];
+    for (const c of ring) {
+      pts.push([c[0], c[1]]);
+      pts.push([c[0] + dLng, c[1] + dLat]);
+    }
+    const hull = convexHull(pts);
+    if (hull.length >= 3) out.push({ polygon: hull });
+  }
+  return out;
+}
+
+// ---- Layers ---------------------------------------------------------------
+function renderLayers(altDeg, altRad, sunBearingRad) {
+  const night = altDeg <= 0;
+  const shadows = night ? [] : computeShadows(buildingsFC.features, altRad, sunBearingRad);
+
+  const shadowLayer = new PolygonLayer({
+    id: "shadows",
+    data: shadows,
+    getPolygon: d => d.polygon,
+    stroked: false,
+    filled: true,
+    getFillColor: [12, 16, 28, Math.round(state.shadowAlpha * 255)],
+    // No lighting/shadow on this layer: it must stay a flat constant colour
+    // and not be re-darkened by the GPU shadow pass.
+    material: false,
+    pickable: false,
+    parameters: { depthTest: false }
+  });
+
+  // Drawn after shadows so each building sits on top of its own footprint.
+  const buildings = new GeoJsonLayer({
+    id: "buildings",
+    data: buildingsFC,
+    extruded: true,
+    wireframe: false,
+    getElevation: f => f.properties.height,
+    getFillColor: night ? [120, 130, 150] : [236, 237, 240],
+    material: { ambient: 0.5, diffuse: 0.6, shininess: 20, specularColor: [40,40,40] },
+    pickable: false,
+    parameters: { depthTest: true }
+  });
+
+  deckOverlay.setProps({ layers: [shadowLayer, buildings] });
+  forceShadowRedraw();
+}
+
+// ---- Buildings from Overpass ---------------------------------------------
+function parseHeight(tags) {
+  if (!tags) return 9;
+  if (tags.height) {
+    const h = parseFloat(String(tags.height).replace(",", "."));
+    if (!isNaN(h) && h > 0) return Math.max(2, h);
+  }
+  if (tags["building:levels"]) {
+    const l = parseFloat(tags["building:levels"]);
+    if (!isNaN(l) && l > 0) return Math.max(2, l * 3.1);
+  }
+  return 9; // sensible default for an untagged building
+}
+
+function ringFromGeometry(geom) {
+  if (!geom || geom.length < 3) return null;
+  const ring = geom.map(p => [p.lon, p.lat]);
+  const a = ring[0], b = ring[ring.length - 1];
+  if (a[0] !== b[0] || a[1] !== b[1]) ring.push([a[0], a[1]]);
+  return ring;
+}
+
+async function loadBuildings() {
+  const z = map.getZoom();
+  if (z < 14.2) {
+    buildingsFC = { type: "FeatureCollection", features: [] };
+    showStatus("Zoom in to load 3D buildings", false);
+    renderLayers(45, 0.78, 0);
+    return;
+  }
+  const b = map.getBounds();
+  const s = b.getSouth(), w = b.getWest(), n = b.getNorth(), e = b.getEast();
+  const key = [s,w,n,e].map(v => v.toFixed(3)).join(",");
+  if (key === lastBBoxKey) return;
+  lastBBoxKey = key;
+
+  const myToken = ++fetchToken;
+  showStatus("Loading buildings…", true);
+
+  const q = `[out:json][timeout:25];(way["building"](${s},${w},${n},${e});` +
+            `relation["building"]["type"="multipolygon"](${s},${w},${n},${e}););out body geom;`;
+  const endpoints = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter"
+  ];
+
+  let data = null;
+  for (const url of endpoints) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        body: "data=" + encodeURIComponent(q)
+      });
+      if (!res.ok) continue;
+      data = await res.json();
+      break;
+    } catch (_) { /* try next endpoint */ }
+  }
+  if (myToken !== fetchToken) return; // a newer request superseded this one
+
+  if (!data || !data.elements) {
+    showStatus("Could not load buildings (Overpass busy) — try again", false);
+    return;
+  }
+
+  const feats = [];
+  for (const el of data.elements) {
+    const tags = el.tags || {};
+    const h = parseHeight(tags);
+    if (el.type === "way" && el.geometry) {
+      const ring = ringFromGeometry(el.geometry);
+      if (ring) feats.push(polyFeature([ring], h));
+    } else if (el.type === "relation" && el.members) {
+      for (const m of el.members) {
+        if (m.role === "outer" && m.geometry) {
+          const ring = ringFromGeometry(m.geometry);
+          if (ring) feats.push(polyFeature([ring], h));
+        }
+      }
+    }
+  }
+  buildingsFC = { type: "FeatureCollection", features: feats };
+
+  if (feats.length === 0) showStatus("No OSM building data in this area", false);
+  else hideStatus();
+  recompute();
+}
+
+function polyFeature(coords, height) {
+  return {
+    type: "Feature",
+    properties: { height },
+    geometry: { type: "Polygon", coordinates: coords }
+  };
+}
+
+// ---- Status toast ---------------------------------------------------------
+let statusTimer = null;
+function showStatus(text, spinning) {
+  const el = document.getElementById("status");
+  document.getElementById("statusText").textContent = text;
+  el.querySelector(".spinner").style.display = spinning ? "block" : "none";
+  el.classList.add("show");
+  clearTimeout(statusTimer);
+  if (!spinning) statusTimer = setTimeout(hideStatus, 3500);
+}
+function hideStatus() { document.getElementById("status").classList.remove("show"); }
+
+// ---- Animation ------------------------------------------------------------
+let rafId = null, lastTick = 0;
+function animate(ts) {
+  if (!state.playing) return;
+  if (ts - lastTick > 55) {
+    lastTick = ts;
+    state.minutes = (state.minutes + state.speed) % 1440;
+    document.getElementById("timeSlider").value = state.minutes;
+    recompute();
+  }
+  rafId = requestAnimationFrame(animate);
+}
+function setPlaying(p) {
+  state.playing = p;
+  document.getElementById("playBtn").textContent = p ? "❚❚" : "▶";
+  if (p) { lastTick = 0; rafId = requestAnimationFrame(animate); }
+  else if (rafId) cancelAnimationFrame(rafId);
+}
+
+// ---- UI wiring ------------------------------------------------------------
+const dateInput = document.getElementById("dateInput");
+dateInput.value = state.dateStr;
+dateInput.addEventListener("change", () => {
+  if (dateInput.value) { state.dateStr = dateInput.value; recompute(); }
+});
+
+const timeSlider = document.getElementById("timeSlider");
+timeSlider.value = state.minutes;
+timeSlider.addEventListener("input", () => {
+  state.minutes = +timeSlider.value;
+  recompute();
+});
+
+document.getElementById("playBtn").addEventListener("click", () => setPlaying(!state.playing));
+
+document.getElementById("speedSel").addEventListener("change", e => {
+  state.speed = +e.target.value;
+});
+
+document.getElementById("shadowStrength").addEventListener("input", e => {
+  state.shadowAlpha = +e.target.value / 100;
+  recompute();
+});
+
+document.getElementById("dial3dToggle").addEventListener("change", e => {
+  state.dial3d = e.target.checked;
+  recompute();
+});
+
+document.getElementById("nowBtn").addEventListener("click", () => {
+  const now = new Date();
+  state.dateStr = isoDate(now);
+  state.minutes = now.getHours() * 60 + now.getMinutes();
+  dateInput.value = state.dateStr;
+  timeSlider.value = state.minutes;
+  setPlaying(false);
+  recompute();
+});
+
+// Location search via Nominatim (on submit only — respects usage policy)
+async function doSearch() {
+  const q = document.getElementById("searchInput").value.trim();
+  if (!q) return;
+  showStatus("Searching…", true);
+  try {
+    const url = "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" +
+                encodeURIComponent(q);
+    const res = await fetch(url, { headers: { "Accept-Language": "en" } });
+    const arr = await res.json();
+    if (arr && arr.length) {
+      const r = arr[0];
+      map.flyTo({
+        center: [parseFloat(r.lon), parseFloat(r.lat)],
+        zoom: 16, pitch: 52, duration: 1800
+      });
+      hideStatus();
+    } else {
+      showStatus("No results for “" + q + "”", false);
+    }
+  } catch (_) {
+    showStatus("Search failed — check connection", false);
+  }
+}
+document.getElementById("searchBtn").addEventListener("click", doSearch);
+document.getElementById("searchInput").addEventListener("keydown", e => {
+  if (e.key === "Enter") doSearch();
+});
+
+// ---- Map lifecycle --------------------------------------------------------
+let moveTimer = null;
+map.on("moveend", () => {
+  clearTimeout(moveTimer);
+  moveTimer = setTimeout(() => { loadBuildings(); recompute(); }, 550);
+});
+
+map.on("load", () => {
+  recompute();
+  loadBuildings();
+  updateCompass();
+  updateURL();
+});
+</script>
+</body>
+</html>

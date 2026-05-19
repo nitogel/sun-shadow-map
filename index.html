@@ -411,7 +411,9 @@ function syncSundialDeck() {
     const date = currentUTCDate();
     const pos = SunCalc.getPosition(date, c.lat, c.lng);
     const times = SunCalc.getTimes(date, c.lat, c.lng);
-    sundialLayers = buildSundial3D(c.lng, c.lat, pos, times);
+    const mpos = SunCalc.getMoonPosition(date, c.lat, c.lng);
+    const mill = SunCalc.getMoonIllumination(date);
+    sundialLayers = buildSundial3D(c.lng, c.lat, pos, times, mpos, mill);
   } else {
     sundialLayers = [];
   }
@@ -531,14 +533,28 @@ function atmosphere(alt) {
   }
   return ATMO[0];
 }
-function applyAtmosphere(altDeg) {
+// MOON_SKY: target tint the night sky is lifted toward when the moon is up,
+// so the #sky multiply doesn't crush the scene to black and moon shadows
+// stay readable. Kept dim and cool — it's still night.
+const MOON_SKY = [126, 138, 170];
+function applyAtmosphere(altDeg, mAltDeg, mFrac) {
   const m = atmosphere(altDeg);
+  let sky = m.sky, ai = m.ai, amb = m.amb;
+  if (altDeg <= 0 && mAltDeg != null && mAltDeg > 0) {
+    // Moonlight strength: rises with moon altitude and illuminated fraction,
+    // capped so a full moon is still clearly night, not daylight.
+    const k = Math.min(1, mAltDeg / 38) * (0.30 + 0.70 * (mFrac == null ? 0.5 : mFrac));
+    const t = k * 0.6;
+    sky = lerpRGB(t, m.sky, MOON_SKY);
+    amb = lerpRGB(Math.min(1, t * 1.2), m.amb, [150, 162, 195]);
+    ai = m.ai + 0.22 * k;
+  }
   sunLight.color = m.sun;
   sunLight.intensity = m.si;
-  ambientLight.color = m.amb;
-  ambientLight.intensity = m.ai;
+  ambientLight.color = amb;
+  ambientLight.intensity = ai;
   document.getElementById("sky").style.backgroundColor =
-    "rgb(" + m.sky[0] + "," + m.sky[1] + "," + m.sky[2] + ")";
+    "rgb(" + sky[0] + "," + sky[1] + "," + sky[2] + ")";
 }
 
 // ---- Sun / time math ------------------------------------------------------
@@ -577,13 +593,16 @@ function recompute() {
   const c = map.getCenter();
   const date = currentUTCDate();
 
-  // Sun info via SunCalc
+  // Sun + moon via SunCalc
   const pos = SunCalc.getPosition(date, c.lat, c.lng);
   const altDeg = pos.altitude * 180 / Math.PI;
+  const mpos = SunCalc.getMoonPosition(date, c.lat, c.lng);
+  const mill = SunCalc.getMoonIllumination(date);
+  const mAltDeg = mpos.altitude * 180 / Math.PI;
 
-  // Tint scene + colour the sun by altitude, then update the sun in place
-  // (do NOT recreate the lighting/effect).
-  applyAtmosphere(altDeg);
+  // Tint scene + colour the sun by altitude (a moonlit lift keeps the night
+  // from crushing to black so moon shadows read), then update sun in place.
+  applyAtmosphere(altDeg, mAltDeg, mill.fraction);
   applySun(date.getTime());
   const times = SunCalc.getTimes(date, c.lat, c.lng);
 
@@ -598,9 +617,10 @@ function recompute() {
 
   syncSundialDeck(); // rebuilds + pushes the dial from the live map centre
 
-  // pos.azimuth is measured from south (SunCalc); +PI converts to a
-  // compass bearing (0 = N, clockwise) for the shadow projection.
-  renderLayers(altDeg, pos.altitude, pos.azimuth + Math.PI);
+  // azimuth is measured from south (SunCalc); +PI converts to a compass
+  // bearing (0 = N, clockwise) for the shadow projection.
+  renderLayers(altDeg, pos.altitude, pos.azimuth + Math.PI,
+               mAltDeg, mpos.altitude, mpos.azimuth + Math.PI, mill.fraction);
 }
 
 
@@ -726,8 +746,9 @@ function updateNowLine(nowH) {
 // ring with degree ticks/labels, the day's 3D sun-path orbit, sunrise/sunset
 // markers, the live sun, and rays showing azimuth + altitude angles.
 const DIAL3D_CS = [...("0123456789:.,-° ABCDEFGHIJKLMNOPQRSTUVWXYZ")];
-const dial3dCache = { key: "", orbitUp: [], orbitDn: [], ring: [], ticks: [],
-                      labels: [], riseset: [], R: 200, Rc: 216 };
+const dial3dCache = { key: "", orbitUp: [], orbitDn: [], moonUp: [], moonDn: [],
+                      ring: [], ticks: [], labels: [], riseset: [],
+                      R: 200, Rc: 216 };
 
 function metersPerPixel(lat, zoom) {
   return 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoom);
@@ -740,7 +761,7 @@ function sunLocal(altRad, bearingRad, R) {
   return [hd * Math.sin(bearingRad), hd * Math.cos(bearingRad), R * Math.sin(altRad)];
 }
 
-function buildSundial3D(lng, lat, pos, times) {
+function buildSundial3D(lng, lat, pos, times, mpos, mill) {
   const zoom = map.getZoom();
   let R = 120 * metersPerPixel(lat, zoom); // ~constant on-screen size
   R = Math.max(40, Math.min(3000, R));
@@ -765,6 +786,17 @@ function buildSundial3D(lng, lat, pos, times) {
         up.push(sunLocal(p.altitude, b, R));
       } else {
         dn.push([R * Math.sin(b), R * Math.cos(b), 0]);
+      }
+    }
+    // Moon path over the same day (always shown; below-horizon arc dimmed).
+    const mup = [], mdn = [];
+    for (let m = 0; m <= 1440; m += 5) {
+      const mp = SunCalc.getMoonPosition(utcDateForMinute(m), lat, lng);
+      const mb = mp.azimuth + Math.PI;
+      if (mp.altitude >= 0) {
+        mup.push(sunLocal(mp.altitude, mb, R));
+      } else {
+        mdn.push([R * Math.sin(mb), R * Math.cos(mb), 0]);
       }
     }
     const ring = [], ticks = [], labels = [];
@@ -793,7 +825,8 @@ function buildSundial3D(lng, lat, pos, times) {
     const rs = [], sr = mk(times.sunrise), ss = mk(times.sunset);
     if (sr) rs.push({ p: sr, txt: utcToLocalHM(times.sunrise), kind: "rise" });
     if (ss) rs.push({ p: ss, txt: utcToLocalHM(times.sunset), kind: "set" });
-    Object.assign(dial3dCache, { orbitUp: up, orbitDn: dn, ring, ticks,
+    Object.assign(dial3dCache, { orbitUp: up, orbitDn: dn, moonUp: mup,
+                                 moonDn: mdn, ring, ticks,
                                  labels, riseset: rs, R, Rc });
   }
 
@@ -814,6 +847,21 @@ function buildSundial3D(lng, lat, pos, times) {
   const rayEnd = below ? sunPos
     : [hdSun * RAY_EXT * Math.sin(bRad), hdSun * RAY_EXT * Math.cos(bRad),
        upSun * RAY_EXT];
+
+  // Live moon: position, a subdued ray, and a disc whose brightness tracks
+  // the illuminated fraction (dim near new moon, bright near full).
+  const mAlt = mpos ? mpos.altitude : -1;
+  const mB = (mpos ? mpos.azimuth : 0) + Math.PI;
+  const mBelow = mAlt < 0;
+  const moonPos = sunLocal(Math.max(mAlt, 0), mB, C.R);
+  const hdMoon = C.R * Math.cos(Math.max(mAlt, 0));
+  const upMoon = C.R * Math.sin(Math.max(mAlt, 0));
+  const moonRayEnd = mBelow ? moonPos
+    : [hdMoon * RAY_EXT * Math.sin(mB), hdMoon * RAY_EXT * Math.cos(mB),
+       upMoon * RAY_EXT];
+  const mFrac = mill ? mill.fraction : 0.5;
+  const mDiscA = Math.round(110 + 130 * mFrac); // 110..240 by phase
+
   const dash = deck.PathStyleExtension
     ? [new deck.PathStyleExtension({ dash: true })] : [];
   const ND = { depthTest: false };
@@ -856,6 +904,22 @@ function buildSundial3D(lng, lat, pos, times) {
     L.push(new PathLayer({
       id: "d3-orbit-up", data: [C.orbitUp], getPath: d => d,
       getColor: [255, 205, 60, 235], getWidth: 3, widthUnits: "pixels",
+      capRounded: true, jointRounded: true, coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+    }));
+  }
+
+  // Moon path (cool silver). Below-horizon portion dashed + dim, like the sun.
+  if (C.moonDn.length) {
+    L.push(new PathLayer(Object.assign({
+      id: "d3-moon-dn", data: [C.moonDn], getPath: d => d,
+      getColor: [150, 168, 205, 70], getWidth: 1.5, widthUnits: "pixels",
+      coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND, extensions: dash
+    }, dash.length ? { getDashArray: [5, 4], dashJustified: true } : {})));
+  }
+  if (C.moonUp.length) {
+    L.push(new PathLayer({
+      id: "d3-moon-up", data: [C.moonUp], getPath: d => d,
+      getColor: [176, 196, 230, 215], getWidth: 2.4, widthUnits: "pixels",
       capRounded: true, jointRounded: true, coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
     }));
   }
@@ -911,6 +975,29 @@ function buildSundial3D(lng, lat, pos, times) {
     stroked: true,
     getLineColor: below ? [120, 130, 150, 210] : [255, 180, 60, 255],
     getLineWidth: 1.5, lineWidthUnits: "pixels", coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+  }));
+
+  // Moon ray + halo + disc (cool, subdued so the sun stays primary).
+  L.push(new LineLayer({
+    id: "d3-moon-ray", data: [{ s: center, t: moonRayEnd }],
+    getSourcePosition: d => d.s, getTargetPosition: d => d.t,
+    getColor: mBelow ? [150, 165, 200, 90] : [180, 200, 235, 200],
+    getWidth: mBelow ? 1.6 : 2.6, widthUnits: "pixels",
+    coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+  }));
+  L.push(new ScatterplotLayer({
+    id: "d3-moon-halo", data: [moonPos], getPosition: d => d,
+    getRadius: mBelow ? 7 : 16, radiusUnits: "pixels",
+    getFillColor: [185, 205, 240, mBelow ? 45 : 80],
+    coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
+  }));
+  L.push(new ScatterplotLayer({
+    id: "d3-moon", data: [moonPos], getPosition: d => d,
+    getRadius: mBelow ? 4 : 8, radiusUnits: "pixels",
+    getFillColor: [225, 232, 245, mBelow ? 150 : mDiscA],
+    stroked: true, getLineColor: [200, 212, 235, 220],
+    getLineWidth: 1.2, lineWidthUnits: "pixels",
+    coordinateSystem: CS, coordinateOrigin: ORIGIN, parameters: ND
   }));
 
   L.push(new TextLayer({
@@ -1002,9 +1089,22 @@ function computeShadows(features, altRad, sunBearingRad) {
 }
 
 // ---- Layers ---------------------------------------------------------------
-function renderLayers(altDeg, altRad, sunBearingRad) {
+function renderLayers(altDeg, altRad, sunBearingRad,
+                      mAltDeg, mAltRad, mBearingRad, mFrac) {
   const night = altDeg <= 0;
   const shadows = night ? [] : computeShadows(buildingsFC.features, altRad, sunBearingRad);
+
+  // Moonlight is ~1e6x fainter than sunlight, so true moon shadows are
+  // invisible — these are deliberately stylised: only at night, only while
+  // the moon is up, faint and cool-tinted, slightly stronger near full moon.
+  const moonUp = mAltDeg != null && mAltDeg > 0;
+  const moonShadows = (night && moonUp)
+    ? computeShadows(buildingsFC.features, mAltRad, mBearingRad) : [];
+  // Stylised (not physical): the night ground is already dark, so a faint
+  // shadow would vanish. Use a distinctly cool tone at a strong enough alpha
+  // that the projected direction is clearly readable; scale a bit by phase.
+  const mShadowA = Math.min(205,
+    Math.round((0.34 + 0.26 * (mFrac == null ? 0.5 : mFrac)) * 255));
 
   const shadowLayer = new PolygonLayer({
     id: "shadows",
@@ -1020,6 +1120,18 @@ function renderLayers(altDeg, altRad, sunBearingRad) {
     parameters: { depthTest: false }
   });
 
+  const moonShadowLayer = new PolygonLayer({
+    id: "moon-shadows",
+    data: moonShadows,
+    getPolygon: d => d.polygon,
+    stroked: false,
+    filled: true,
+    getFillColor: [22, 30, 60, mShadowA], // cool steel-blue — moonlit shade
+    material: false,
+    pickable: false,
+    parameters: { depthTest: false }
+  });
+
   // Drawn after shadows so each building sits on top of its own footprint.
   const buildings = new GeoJsonLayer({
     id: "buildings",
@@ -1027,13 +1139,14 @@ function renderLayers(altDeg, altRad, sunBearingRad) {
     extruded: true,
     wireframe: false,
     getElevation: f => f.properties.height,
-    getFillColor: night ? [120, 130, 150] : [236, 237, 240],
+    getFillColor: night ? (moonUp ? [171, 182, 208] : [120, 130, 150])
+                         : [236, 237, 240],
     material: { ambient: 0.5, diffuse: 0.6, shininess: 20, specularColor: [40,40,40] },
     pickable: false,
     parameters: { depthTest: true }
   });
 
-  deckOverlay.setProps({ layers: [shadowLayer, buildings] });
+  deckOverlay.setProps({ layers: [shadowLayer, moonShadowLayer, buildings] });
   forceShadowRedraw();
 }
 

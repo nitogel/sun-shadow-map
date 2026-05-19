@@ -112,6 +112,7 @@
   .field.solar { margin-left: auto; }
   .field.solar + .field.solar { margin-left: 18px; }
   #tiltReadout, #insReadout { font-size: 16px; font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+  #moonReadout { font-size: 16px; font-weight: 700; color: #a9c0e6; font-variant-numeric: tabular-nums; }
   #insChart { width: 100%; height: 84px; margin-top: 10px; }
   #sliderRow { margin-top: 6px; display: flex; align-items: center; gap: 12px; }
   #sliderRow .ends { font-size: 10.5px; color: var(--muted); width: 34px; text-align: center; }
@@ -223,6 +224,10 @@
     <div class="field solar">
       <label>Solar insolation / day</label>
       <div id="insReadout">–</div>
+    </div>
+    <div class="field solar">
+      <label>Moon phase · illumination</label>
+      <div id="moonReadout">–</div>
     </div>
   </div>
 
@@ -356,9 +361,44 @@ map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom
 
 // ---- deck.gl overlay (overlaid mode — required for the shadow effect) ------
 const { MapboxOverlay, GeoJsonLayer, PolygonLayer, LightingEffect, AmbientLight,
-        ScatterplotLayer, PathLayer, LineLayer, TextLayer, COORDINATE_SYSTEM } = deck;
+        ScatterplotLayer, PathLayer, LineLayer, TextLayer, COORDINATE_SYSTEM,
+        LayerExtension } = deck;
 const SunLight = deck._SunLight; // experimental: positions a directional light from a timestamp
 let sundialLayers = [];
+
+// Stylised facade for the extruded buildings. deck.gl's SolidPolygonLayer has
+// no UVs/textures, but the per-fragment extruded height IS reliable (`pos.z`
+// in metres, present in every sub-model's vertex shader). So we band purely
+// by elevation: horizontal "floor" lines + a glass tint by day, bright-yellow
+// lit floors by night. No normals / tangents / roof tests — the parts that
+// were fragile before — so flat roofs just take a uniform tint (never vanish).
+// `night` is baked into the shader; the buildings layer is rebuilt each
+// update, so it only recompiles when day/night flips.
+class FacadeExtension extends LayerExtension {
+  getShaders(extension) {
+    return {
+      inject: {
+        "vs:#decl": "out float vFacH;\n",
+        // Per-vertex extruded height in METRES: exactly what the layer adds
+        // to pos.z internally (props.elevations = elevations * positions.y,
+        // 0 at the base ring, building height at the top). `pos.z` itself is
+        // already 0 again by main-end, so capture this instead.
+        "vs:#main-end": "vFacH = props.elevations * elevationScale;\n",
+        "fs:#decl": "in float vFacH;\n",
+        "fs:DECKGL_FILTER_COLOR": [
+          "{",
+          "  float fH = 3.5;",                          // storey height (m)
+          "  float f = fract(vFacH / fH);",             // 0..1 within a storey
+          "  // wide window strip per storey, thin dark spandrel between floors",
+          "  float win = smoothstep(0.06, 0.16, f) * (1.0 - smoothstep(0.80, 0.92, f));",
+          "  vec3 glass = mix(color.rgb, vec3(0.62, 0.74, 0.90), 0.60);", // bright cool glass
+          "  color.rgb = mix(color.rgb * 0.50, glass, win);",             // dark slab line
+          "}"
+        ].join("\n")
+      }
+    };
+  }
+}
 
 // Lighting is created ONCE and mutated in place. Re-creating the SunLight /
 // LightingEffect on every update was the cause of the "flat grey until you
@@ -589,6 +629,19 @@ function utcToLocalHM(d) {
          String(t.getUTCMinutes()).padStart(2, "0");
 }
 
+// SunCalc moon phase (0=new, .25=first quarter, .5=full, .75=last quarter)
+// -> the conventional 8 names, with small windows around the exact phases.
+function moonPhaseName(p) {
+  if (p < 0.033 || p > 0.967) return "New moon";
+  if (p < 0.217) return "Waxing crescent";
+  if (p < 0.283) return "First quarter";
+  if (p < 0.467) return "Waxing gibbous";
+  if (p < 0.533) return "Full moon";
+  if (p < 0.717) return "Waning gibbous";
+  if (p < 0.783) return "Last quarter";
+  return "Waning crescent";
+}
+
 function recompute() {
   const c = map.getCenter();
   const date = currentUTCDate();
@@ -612,6 +665,11 @@ function recompute() {
   document.getElementById("dateReadout").textContent =
     new Date(Y, M - 1, D).toLocaleDateString(undefined,
       { weekday: "short", month: "short", day: "numeric" });
+  // Moon phase + illumination + whether it's currently above the horizon.
+  // Makes the new-moon case self-explanatory (moon rides near the sun).
+  document.getElementById("moonReadout").textContent =
+    moonPhaseName(mill.phase) + " · " + Math.round(mill.fraction * 100) + "%" +
+    " · " + (mAltDeg > 0 ? "up " + mAltDeg.toFixed(0) + "°" : "below horizon");
 
   refreshSolar(c.lat, c.lng);
 
@@ -1143,7 +1201,8 @@ function renderLayers(altDeg, altRad, sunBearingRad,
                          : [236, 237, 240],
     material: { ambient: 0.5, diffuse: 0.6, shininess: 20, specularColor: [40,40,40] },
     pickable: false,
-    parameters: { depthTest: true }
+    parameters: { depthTest: true },
+    extensions: [new FacadeExtension({ night })]
   });
 
   deckOverlay.setProps({ layers: [shadowLayer, moonShadowLayer, buildings] });

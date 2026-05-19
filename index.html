@@ -108,6 +108,7 @@
     border-radius: 8px; padding: 7px 9px; font-size: 13px; color-scheme: dark;
   }
   #timeReadout { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; min-width: 86px; }
+  #timeAux { font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
   #dateReadout { font-size: 11.5px; color: var(--muted); }
   .field.solar { margin-left: auto; }
   .field.solar + .field.solar { margin-left: 18px; }
@@ -208,8 +209,9 @@
   <div id="ctrlTop">
     <button id="playBtn" title="Play / pause day animation">▶</button>
     <div class="field">
-      <label>Time of day (local solar)</label>
+      <label>Time of day · <span id="tzLabel">local</span></label>
       <div id="timeReadout">12:00</div>
+      <div id="timeAux" title="The clock above is the civil local time at the map centre (with summer/winter time). This shows the same instant in UTC and in your browser's timezone.">–</div>
     </div>
     <div class="field">
       <label>Date</label>
@@ -291,10 +293,12 @@
    Stack: MapLibre GL (basemap) + deck.gl (extruded OSM buildings + SunLight
    shadow effect) + SunCalc (sun info) + Overpass (building data) + Nominatim.
 
-   Time model: the date/time chosen is treated as *local solar time* at the map
-   centre. We approximate the timezone purely from longitude (lon / 15° = hours)
-   so that "12:00" is always ~solar noon anywhere on Earth. For a sun-study tool
-   this is more intuitive and robust than resolving political time zones.
+   Time model: the date/time chosen is the *civil local time* at the map
+   centre. The map coordinates are resolved to a real IANA timezone (free,
+   no-key timeapi.io) and every instant is converted through that zone, so
+   summer/winter time is applied correctly for whatever date the slider picks.
+   Until the zone resolves (or if the lookup fails) it falls back to a
+   longitude estimate (lon / 15° = hours), flagged with "≈" in the label.
 ---------------------------------------------------------------------------- */
 
 const DEFAULT = { lng: -73.9857, lat: 40.7580, zoom: 16, pitch: 52, bearing: 18 }; // Midtown Manhattan
@@ -334,8 +338,8 @@ function updateURLThrottled() {
 
 // ---- State ----------------------------------------------------------------
 let state = {
-  dateStr: isoDate(new Date(2026, 4, 17)), // YYYY-MM-DD (local solar)
-  minutes: 720,                            // 0..1439 minutes after local-solar midnight
+  dateStr: isoDate(new Date(2026, 4, 17)), // YYYY-MM-DD (civil local at map)
+  minutes: 720,                            // 0..1439 min after civil-local midnight
   playing: false,
   speed: 6,                                // sim-minutes added per animation frame
   shadowAlpha: 0.38,
@@ -608,23 +612,84 @@ function fmtHM(mins) {
   return String(Math.floor(mins / 60)).padStart(2, "0") + ":" +
          String(mins % 60).padStart(2, "0");
 }
-// Longitude-based offset (hours) so chosen clock time == local solar time.
+// Longitude-based offset (hours): the mean-solar fallback used until the
+// real IANA timezone resolves (or if the lookup fails).
 function lonOffsetHours() {
   return map.getCenter().lng / 15;
 }
-// Convert the chosen local-solar date+time to the true UTC instant.
-function currentUTCDate() {
-  const [Y, M, D] = state.dateStr.split("-").map(Number);
-  const utcMs = Date.UTC(Y, M - 1, D, 0, 0, 0) +
-                state.minutes * 60000 -
-                lonOffsetHours() * 3600000;
-  return new Date(utcMs);
+
+// ---- Civil timezone at the map centre ------------------------------------
+// The longitude approximation can't know political zone boundaries or
+// daylight-saving, so the real civil clock at the map place comes from a
+// proper IANA timezone. We resolve coords -> IANA zone via a free, no-key
+// service (timeapi.io), cache it per coarse location, and let Intl apply the
+// correct DST for whatever instant the slider picks. Longitude is the
+// graceful fallback until/unless the lookup succeeds.
+let mapTZ = null;        // e.g. "Europe/Kyiv" (null = not resolved yet)
+let mapTZKey = "";       // coarse "lat|lng" key the current mapTZ was fetched for
+let mapTZFetching = false;
+function mapPlaceLabel() {
+  if (!mapTZ) return "local";
+  const part = mapTZ.split("/").pop() || mapTZ;
+  return part.replace(/_/g, " ");
 }
-// Format a UTC Date back into local-solar HH:MM for display.
+function refreshMapTimezone() {
+  const c = map.getCenter();
+  const key = c.lat.toFixed(1) + "|" + c.lng.toFixed(1); // ~11 km buckets
+  if (key === mapTZKey || mapTZFetching) return;
+  mapTZFetching = true;
+  fetch("https://timeapi.io/api/timezone/coordinate?latitude=" +
+        c.lat.toFixed(4) + "&longitude=" + c.lng.toFixed(4))
+    .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
+    .then((j) => {
+      if (j && j.timeZone) {
+        // Validate the zone is usable by Intl before adopting it.
+        new Intl.DateTimeFormat("en-GB", { timeZone: j.timeZone });
+        mapTZ = j.timeZone;
+        mapTZKey = key;
+        recompute(); // refresh readout now that the real zone is known
+      }
+    })
+    .catch(() => { /* keep longitude fallback */ })
+    .finally(() => { mapTZFetching = false; });
+}
+// Signed offset (ms) of the map place's civil clock from UTC *at the given
+// instant* — i.e. zoneWallMs = utcMs + tzOffsetMsAt(utcMs). Uses the resolved
+// IANA zone (so daylight-saving is applied for that exact instant), and falls
+// back to the longitude estimate until the zone is known / if it fails.
+function tzOffsetMsAt(utcMs) {
+  if (mapTZ) {
+    try {
+      const p = {};
+      new Intl.DateTimeFormat("en-US", {
+        timeZone: mapTZ, hour12: false,
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", second: "2-digit"
+      }).formatToParts(new Date(utcMs)).forEach((x) => { p[x.type] = x.value; });
+      const wall = Date.UTC(+p.year, +p.month - 1, +p.day,
+                            (+p.hour) % 24, +p.minute, +p.second);
+      return wall - utcMs;
+    } catch (e) { /* fall through to longitude */ }
+  }
+  return lonOffsetHours() * 3600000;
+}
+// Convert a wall-clock day+minute at the map place into the true UTC instant.
+// Two passes resolve the chicken-and-egg around DST transition days.
+function wallToUTC(dateStr, minutes) {
+  const [Y, M, D] = dateStr.split("-").map(Number);
+  const wallMs = Date.UTC(Y, M - 1, D, 0, 0, 0) + minutes * 60000;
+  let utc = wallMs - tzOffsetMsAt(wallMs);
+  utc = wallMs - tzOffsetMsAt(utc);
+  return new Date(utc);
+}
+// Convert the chosen civil local date+time to the true UTC instant.
+function currentUTCDate() {
+  return wallToUTC(state.dateStr, state.minutes);
+}
+// Format a UTC instant as civil HH:MM at the map place (DST-correct).
 function utcToLocalHM(d) {
   if (!d || isNaN(d)) return "–";
-  const ms = d.getTime() + lonOffsetHours() * 3600000;
-  const t = new Date(ms);
+  const t = new Date(d.getTime() + tzOffsetMsAt(d.getTime()));
   return String(t.getUTCHours()).padStart(2, "0") + ":" +
          String(t.getUTCMinutes()).padStart(2, "0");
 }
@@ -659,8 +724,19 @@ function recompute() {
   applySun(date.getTime());
   const times = SunCalc.getTimes(date, c.lat, c.lng);
 
-  // UI readouts
+  // UI readouts. The big clock is now the map place's civil time (DST-aware);
+  // name the place in the label and show the same instant in UTC + the
+  // viewer's own browser timezone underneath for cross-reference.
   document.getElementById("timeReadout").textContent = fmtHM(state.minutes);
+  document.getElementById("tzLabel").textContent =
+    mapPlaceLabel() + (mapTZ ? "" : " ≈");
+  {
+    const p2 = (n) => String(n).padStart(2, "0");
+    const utcHM = p2(date.getUTCHours()) + ":" + p2(date.getUTCMinutes());
+    const brHM = p2(date.getHours()) + ":" + p2(date.getMinutes());
+    document.getElementById("timeAux").textContent =
+      "UTC " + utcHM + " · your browser " + brHM;
+  }
   const [Y, M, D] = state.dateStr.split("-").map(Number);
   document.getElementById("dateReadout").textContent =
     new Date(Y, M - 1, D).toLocaleDateString(undefined,
@@ -684,9 +760,7 @@ function recompute() {
 
 // ---- Sun time helper ------------------------------------------------------
 function utcDateForMinute(min) {
-  const [Y, M, D] = state.dateStr.split("-").map(Number);
-  return new Date(Date.UTC(Y, M - 1, D, 0, 0, 0) + min * 60000 -
-                  lonOffsetHours() * 3600000);
+  return wallToUTC(state.dateStr, min);
 }
 // (2D dial removed; the on-map 3D sundial below is the only sun-path UI.)
 
@@ -1367,9 +1441,16 @@ document.getElementById("dial3dToggle").addEventListener("change", e => {
 });
 
 document.getElementById("nowBtn").addEventListener("click", () => {
-  const now = new Date();
-  state.dateStr = isoDate(now);
-  state.minutes = now.getHours() * 60 + now.getMinutes();
+  // `Date.now()` is the true current instant (UTC, browser-tz independent).
+  // Express it as the *civil wall clock at the map place* (DST-correct via
+  // the resolved zone) so it round-trips through currentUTCDate() back to
+  // the real "now" and shows the actual live sun for that location.
+  const now = Date.now();
+  const wall = new Date(now + tzOffsetMsAt(now));
+  state.dateStr = wall.getUTCFullYear() + "-" +
+    String(wall.getUTCMonth() + 1).padStart(2, "0") + "-" +
+    String(wall.getUTCDate()).padStart(2, "0");
+  state.minutes = wall.getUTCHours() * 60 + wall.getUTCMinutes();
   dateInput.value = state.dateStr;
   timeSlider.value = state.minutes;
   setPlaying(false);
@@ -1409,12 +1490,15 @@ document.getElementById("searchInput").addEventListener("keydown", e => {
 let moveTimer = null;
 map.on("moveend", () => {
   clearTimeout(moveTimer);
-  moveTimer = setTimeout(() => { loadBuildings(); recompute(); }, 550);
+  moveTimer = setTimeout(() => {
+    loadBuildings(); recompute(); refreshMapTimezone();
+  }, 550);
 });
 
 map.on("load", () => {
   recompute();
   loadBuildings();
+  refreshMapTimezone();
   updateCompass();
   updateURL();
 });

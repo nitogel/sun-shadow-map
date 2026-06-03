@@ -179,8 +179,49 @@
     pointer-events: none;
   }
 
+  /* Mobile bottom-sheet toggle (chevron). Hidden on desktop. */
+  #panelToggle {
+    display: none;
+    position: absolute; top: 6px; right: 8px;
+    width: 30px; height: 30px; padding: 0; border-radius: 50%;
+    background: rgba(255,255,255,0.07); border: 1px solid var(--border);
+    color: var(--text); cursor: pointer; line-height: 1; font-size: 12px;
+    align-items: center; justify-content: center;
+    transition: transform 0.2s ease;
+  }
+  #controls:not(.expanded) #panelToggle { transform: rotate(180deg); }
+
   @media (max-width: 640px) {
+    /* Slim the top corners so the map breathes */
     #topbar { width: calc(100vw - 32px); }
+    #brand { padding: 8px 12px; }
+    #brand h1 { font-size: 14px; }
+    #brand span { display: none; }              /* drop the subtitle */
+    #brand .dot { width: 22px; height: 22px; }
+    #searchWrap { padding: 6px; }
+    #searchInput { padding: 8px 10px; font-size: 13px; }
+    #searchBtn { padding: 0 12px; font-size: 12.5px; }
+    #compass { width: 44px; height: 44px; left: 14px; top: 32%; }
+    #compass .clabel { font-size: 8.5px; bottom: -16px; }
+
+    /* Bottom sheet: chevron visible, panel collapsed by default */
+    #panelToggle { display: inline-flex; }
+    #controls { padding: 8px 14px 10px; padding-right: 44px; }
+    #controls #ctrlTop { gap: 10px; }
+
+    /* Collapsed: only ▶ play + clock + slider stay visible */
+    #controls:not(.expanded) #ctrlTop > *:not(#playBtn):not(.f-time) { display: none; }
+    #controls:not(.expanded) #ctrlTop .field label { display: none; }
+    #controls:not(.expanded) #timeReadout { font-size: 18px; min-width: 0; }
+    #controls:not(.expanded) #timeAux { display: none; }
+    #controls:not(.expanded) #insChart { display: none; }
+    #controls:not(.expanded) #extra { display: none; }
+    #controls:not(.expanded) #sliderRow { margin-top: 6px; }
+    #controls:not(.expanded) #sliderRow .ends { display: none; }
+
+    /* Expanded: keep things compact but readable */
+    #controls.expanded #insChart { height: 64px; }
+    #controls.expanded #ctrlTop { row-gap: 8px; }
   }
 </style>
 </head>
@@ -206,9 +247,10 @@
 
 
 <div class="panel" id="controls">
+  <button id="panelToggle" type="button" aria-expanded="false" aria-label="Expand panel" title="Expand / collapse">▾</button>
   <div id="ctrlTop">
     <button id="playBtn" title="Play / pause day animation">▶</button>
-    <div class="field">
+    <div class="field f-time">
       <label>Time of day · <span id="tzLabel">local</span></label>
       <div id="timeReadout">12:00</div>
       <div id="timeAux" title="The clock above is the civil local time at the map centre (with summer/winter time). This shows the same instant in UTC and in your browser's timezone.">–</div>
@@ -895,7 +937,14 @@ function sunLocal(altRad, bearingRad, R) {
 
 function buildSundial3D(lng, lat, pos, times, mpos, mill) {
   const zoom = map.getZoom();
-  let R = 120 * metersPerPixel(lat, zoom); // ~constant on-screen size
+  // Target on-screen ring radius in CSS px: a fixed size on roomy screens, but
+  // capped to a fraction of the smaller viewport edge so the whole dial (ring +
+  // labels + sun ray) always stays inside the screen on phones instead of
+  // spilling past the edges.
+  const cv = map.getCanvas();
+  const vpMin = Math.min(cv.clientWidth || 800, cv.clientHeight || 600);
+  const pxR = Math.min(106, vpMin * 0.18);
+  let R = pxR * metersPerPixel(lat, zoom);
   R = Math.max(40, Math.min(3000, R));
   const Rc = R * 1.08;
   // The whole dial lives in LOCAL metre-offset space sharing ONE origin
@@ -974,7 +1023,7 @@ function buildSundial3D(lng, lat, pos, times, mpos, mill) {
   const altDeg = pos.altitude * 180 / Math.PI;
   // Sun ray: a straight line from the centre, through the sun, continuing
   // well past it so the incoming sunbeam direction is visible.
-  const RAY_EXT = 2.6;
+  const RAY_EXT = 1.35;
   const upSun = C.R * Math.sin(Math.max(altRad, 0));
   const rayEnd = below ? sunPos
     : [hdSun * RAY_EXT * Math.sin(bRad), hdSun * RAY_EXT * Math.cos(bRad),
@@ -1455,6 +1504,21 @@ document.getElementById("nowBtn").addEventListener("click", () => {
   timeSlider.value = state.minutes;
   setPlaying(false);
   recompute();
+});
+
+// Mobile bottom-sheet toggle: collapses the panel to ▶ + clock + slider on
+// small screens so the map stays the focus, and re-flows Highcharts on
+// expand (it measures 0 while display:none and otherwise stays blank).
+document.getElementById("panelToggle").addEventListener("click", () => {
+  const ctrl = document.getElementById("controls");
+  const btn = document.getElementById("panelToggle");
+  ctrl.classList.toggle("expanded");
+  const expanded = ctrl.classList.contains("expanded");
+  btn.setAttribute("aria-expanded", String(expanded));
+  btn.setAttribute("aria-label", expanded ? "Collapse panel" : "Expand panel");
+  if (expanded && typeof insChart !== "undefined" && insChart) {
+    setTimeout(() => { try { insChart.reflow(); } catch (e) { /* ignore */ } }, 60);
+  }
 });
 
 // Location search via Nominatim (on submit only — respects usage policy)

@@ -338,7 +338,7 @@ function updateURLThrottled() {
 
 // ---- State ----------------------------------------------------------------
 let state = {
-  dateStr: isoDate(new Date(2026, 4, 17)), // YYYY-MM-DD (civil local at map)
+  dateStr: isoDate(new Date()),            // YYYY-MM-DD (today, civil local at map)
   minutes: 720,                            // 0..1439 min after civil-local midnight
   playing: false,
   speed: 6,                                // sim-minutes added per animation frame
